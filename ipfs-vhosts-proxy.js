@@ -157,11 +157,6 @@ function createServer(config, requestListener) {
   return http.createServer(requestListener);
 }
 
-function isTargetSubdomainsSupported(target) {
-  const urlObj = new URL(target);
-  return !isIP(urlObj.hostname);
-}
-
 async function start() {
   const config = getConfig();
   const app = express();
@@ -193,6 +188,11 @@ async function start() {
 
   await refreshVhosts();
   const refreshInterval = setInterval(refreshVhosts, 10000);
+
+  const isTargetSubdomainsSupported = (target) => {
+    const urlObj = new URL(target);
+    return config.ipfs.gateway.allowsubdomains && !isIP(urlObj.hostname);
+  };
 
   const getCIDKeyFromPath = (pathName) => {
     const cidKey = Object.keys(state.vhosts).find((key) => {
@@ -254,11 +254,17 @@ async function start() {
     return `${subdomain}.ipfs.${host}`;
   }
 
-  const proxy = httpProxy.createProxyServer({});
+  const proxy = httpProxy.createProxyServer({
+    xfwd: false,
+  });
 
   proxy.on('proxyReq', (proxyReq, req, res, options) => {
+    debug('proxyReq.options', options);
+    debug('proxyReq.headers', req.headers);
     debug('proxyReq.host', proxyReq.getHeader('host'));
-    const cidKey = getCIDKeyFromHost(proxyReq.getHeader('host'));
+    const host = proxyReq.getHeader('x-forwarded-host') || proxyReq.getHeader('host');
+    console.log('proxyReq.fwdhost', host);
+    const cidKey = getCIDKeyFromHost(host);
     debug('proxyReq.host cidKey', cidKey);
     debug('proxyReq.isTargetSubdomainsSupported', isTargetSubdomainsSupported(config.ipfs.gateway.address));
     if (cidKey) {
@@ -274,6 +280,14 @@ async function start() {
     if (newPath) {
       proxyReq.path = newPath;
     }
+
+    debug('setting host headers');
+    proxyReq.setHeader('host', options.target.host);
+    proxyReq.removeHeader('x-forwarded-host');
+    proxyReq.removeHeader('x-forwarded-port');
+    proxyReq.removeHeader('x-forwarded-proto');
+    proxyReq.removeHeader('x-forwarded-for');
+    proxyReq.removeHeader('x-forwarded-server');
   });
 
   proxy.on('error', (err, req, res) => {
@@ -417,6 +431,7 @@ async function start() {
   app.use((req, res) => {
     let target = config.ipfs.gateway.address;
     debug('req.target1', target);
+    debug('req.headers', req.headers);
     debug('req.host', req.headers.host);
     const cidKey = getCIDKeyFromHost(req.headers.host);
     debug('req.cidKey', cidKey);
@@ -435,10 +450,12 @@ async function start() {
       }
     }
 
+    req.headers['x-forwarded-host'] = '';
+
     proxy.web(req, res, {
       target,
-      changeOrigin: true,
       secure: false,
+      xfwd: false,
     });
   });
 
@@ -458,7 +475,7 @@ async function start() {
   });
 
   const shutdown = (signal, value) => {
-    clearInterva(refreshInterval);
+    clearInterval(refreshInterval);
     server.close(() => {
       proxy.close(() => {
         console.log(`Server stopped by ${signal} with value ${value}`);
