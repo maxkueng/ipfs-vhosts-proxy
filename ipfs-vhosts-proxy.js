@@ -112,6 +112,7 @@ function getConfig() {
   }
 
   const config = {
+    debug: values.debug || false,
     proxy: {
       ...defaultConfig.proxy,
       ...(values.proxy || {}),
@@ -161,14 +162,37 @@ function isTargetSubdomainsSupported(target) {
   return !isIP(urlObj.hostname);
 }
 
-function start() {
+async function start() {
   const config = getConfig();
   const app = express();
+
+  const debug = (...args) => {
+    if (config.debug) {
+      console.log('debug', ...args);
+    }
+  }
 
   const ipfs = IpfsClient.create({
     host: config.ipfs.api.host,
     port: config.ipfs.api.port,
   });
+
+  const refreshVhosts = async () => {
+    const data = uint8ArrayConcat(await all(ipfs.cat(`/ipns/${config.ipfs.ipns.name}`)))
+    const json = new TextDecoder().decode(data);
+    state.vhosts = JSON.parse(json);
+  };
+
+  const publishVhosts = async () => {
+    const { cid } = await ipfs.add(JSON.stringify(state.vhosts));
+    await ipfs.name.publish(cid, {
+      lifetime: `${365 * 24}h`,
+      key: config.ipfs.ipns.key,
+    });
+  };
+
+  await refreshVhosts();
+  const refreshInterval = setInterval(refreshVhosts, 10000);
 
   const getCIDKeyFromPath = (pathName) => {
     const cidKey = Object.keys(state.vhosts).find((key) => {
@@ -181,12 +205,14 @@ function start() {
   }
 
   const getCIDKeyFromHost = (host) => {
+    debug('getCIDKeyFromHost.host', host)
     const [hostName] = host.split(':');
     if (isIP(hostName)) {
       return null;
     }
 
     const [subdomain] = hostName.split('.');
+    debug('getCIDKeyFromHost.subdomain', subdomain, Object.keys(state.vhosts).includes(subdomain))
     if (Object.keys(state.vhosts).includes(subdomain)) {
       return subdomain;
     }
@@ -231,15 +257,20 @@ function start() {
   const proxy = httpProxy.createProxyServer({});
 
   proxy.on('proxyReq', (proxyReq, req, res, options) => {
+    debug('proxyReq.host', proxyReq.getHeader('host'));
     const cidKey = getCIDKeyFromHost(proxyReq.getHeader('host'));
+    debug('proxyReq.host cidKey', cidKey);
+    debug('proxyReq.isTargetSubdomainsSupported', isTargetSubdomainsSupported(config.ipfs.gateway.address));
     if (cidKey) {
       if (!isTargetSubdomainsSupported(config.ipfs.gateway.address)) {
+        debug('proxyReq.host.newPath', getIPFSPathFromCIDKey(proxyReq.path, cidKey));
         proxyReq.path = getIPFSPathFromCIDKey(proxyReq.path, cidKey);
       }
       return;
     }
 
     const newPath = getIPFSPathFromPath(proxyReq.path);
+    debug('proxyReq.newPath', newPath);
     if (newPath) {
       proxyReq.path = newPath;
     }
@@ -260,24 +291,6 @@ function start() {
       console.log(err);
       return false;
     }
-  };
-
-  const ipfsCat = async (path) => {
-    const chunks = [];
-  }
-
-  const refreshVhosts = async () => {
-    const data = uint8ArrayConcat(await all(ipfs.cat(`/ipns/${config.ipfs.ipns.name}`)))
-    const json = new TextDecoder().decode(data);
-    state.vhosts = JSON.parse(json);
-  };
-
-  const publishVhosts = async () => {
-    const { cid } = await ipfs.add(JSON.stringify(state.vhosts));
-    await ipfs.name.publish(cid, {
-      lifetime: `${365 * 24}h`,
-      key: config.ipfs.ipns.key,
-    });
   };
 
   const getVhosts = async () => {
@@ -403,14 +416,20 @@ function start() {
 
   app.use((req, res) => {
     let target = config.ipfs.gateway.address;
+    debug('req.target1', target);
+    debug('req.host', req.headers.host);
     const cidKey = getCIDKeyFromHost(req.headers.host);
+    debug('req.cidKey', cidKey);
     if (cidKey) {
+      debug('req.isTargetSubdomainsSupported', isTargetSubdomainsSupported(config.ipfs.gateway.address));
       if (isTargetSubdomainsSupported(config.ipfs.gateway.address)) {
         const targetURLObj = new URL(config.ipfs.gateway.address);
         const host = getIPFSHostFromCIDKey(targetURLObj.host, cidKey);
+        debug('req.newHost', host);
         if (host) {
           targetURLObj.host = host;
           target = targetURLObj.toString();
+          debug('req.target2', host);
           req.headers.host = host;
         }
       }
@@ -439,6 +458,7 @@ function start() {
   });
 
   const shutdown = (signal, value) => {
+    clearInterva(refreshInterval);
     server.close(() => {
       proxy.close(() => {
         console.log(`Server stopped by ${signal} with value ${value}`);
